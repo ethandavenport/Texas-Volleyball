@@ -1,0 +1,1159 @@
+---
+title: "Game Probability"
+output: html_document
+date: "2025-06-04"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r}
+library(tidyverse)
+library(purrr)
+library(glmnet)
+```
+
+
+# IMPLEMENT BAYESIAN APPROACH:
+Use pre-match probability distribution as prior, match results as likelihood to inform posterior
+
+# INSERT ELEMENT OF MOMENTUM:
+Treat each set independently, include some factor of momentum on point-level probabilities
+
+
+WAYS TO IMPROVE THIS PROCESS
+1. Find a better way to impute libero on a match-by-match basis
+2. Shrink ridge APM values on a position-level basis
+3. Have different RAPMs for players in different situations (front row, back row, serving, in receive vs serving)
+4. Only include players as a '1' if they touch the ball at some point in the rally
+
+```{r}
+# Impute when liberos are on the court
+add_liberos <- function(data) {
+
+  player_ids <- data %>%
+    group_by(player_id, position) %>%
+    summarize(n = n()) %>%
+    group_by(player_id) %>%
+    slice_max(n, with_ties = FALSE) %>%
+    ungroup() %>%
+    select(-n) %>%
+    rename(pos = position)
+  
+  shortenings <- data %>%
+    select(team, team_short) %>%
+    distinct() %>%
+    rename(short = team_short)
+  
+  liberos <- data %>%
+    select(team_short) %>%
+    distinct() %>%
+    filter(!is.na(team_short), !team_short %in% c("southflorida", "wichitastate", "tulsa", "pacific", "westvirginia", "washingtonstate", "memphis", "lmu")) %>%
+    rowwise() %>%
+    mutate(libero = generate_starting_lineup(power, team_short)$lineup %>% filter(pos == "L") %>% select(player_id) %>% pull()) %>%
+    left_join(shortenings, by = c("team_short" = "short")) %>%
+    select(team, libero)
+  
+  data <- data %>%
+    mutate(across(
+      c(home_player_id1, home_player_id2, home_player_id3, 
+        home_player_id4, home_player_id5, home_player_id6,
+        visiting_player_id1, visiting_player_id2, visiting_player_id3, 
+        visiting_player_id4, visiting_player_id5, visiting_player_id6),
+      as.character
+    )) %>%
+    left_join(player_ids, by =c("home_player_id5" = "player_id")) %>% rename(home_pos5 = pos) %>%
+    left_join(player_ids, by =c("home_player_id6" = "player_id")) %>% rename(home_pos6 = pos) %>%
+    left_join(player_ids, by =c("home_player_id1" = "player_id")) %>% rename(home_pos1 = pos) %>%
+    left_join(player_ids, by =c("visiting_player_id5" = "player_id")) %>% rename(visiting_pos5 = pos) %>%
+    left_join(player_ids, by =c("visiting_player_id6" = "player_id")) %>% rename(visiting_pos6 = pos) %>%
+    left_join(player_ids, by =c("visiting_player_id1" = "player_id")) %>% rename(visiting_pos1 = pos) %>%
+    left_join(liberos, by = c("home_team" = "team")) %>% rename(home_libero = libero) %>%
+    left_join(liberos, by = c("visiting_team" = "team")) %>% rename(visiting_libero = libero) %>%
+    mutate(
+      home_player_id5 = ifelse(home_pos5 == "Middle", home_libero, home_player_id5),
+      home_player_id6 = ifelse(home_pos6 == "Middle", home_libero, home_player_id6),
+      visiting_player_id5 = ifelse(visiting_pos5 == "Middle", visiting_libero, visiting_player_id5),
+      visiting_player_id6 = ifelse(visiting_pos6 == "Middle", visiting_libero, visiting_player_id6)
+    ) %>%
+    group_by(match_id, point_id) %>%
+    mutate(serve_player_id = ifelse(skill[row_number() == 1] == "Serve", player_id[skill == "Serve" & row_number() == 1], NA)) %>%
+    ungroup() %>%
+    mutate(
+      home_player_id1 = case_when(
+        home_pos1 != "Middle" ~ home_player_id1,
+        home_pos1 == "Middle" & serving_team == visiting_team ~ home_libero,
+        home_pos1 == "Middle" & serving_team == home_team ~ serve_player_id,
+        TRUE ~ NA
+      ),
+      visiting_player_id1 = case_when(
+        visiting_pos1 != "Middle" ~ visiting_player_id1,
+        visiting_pos1 == "Middle" & serving_team == home_team ~ visiting_libero,
+        visiting_pos1 == "Middle" & serving_team == visiting_team ~ serve_player_id,
+        TRUE ~ NA
+      )
+    ) %>%
+    select(-home_pos5, -home_pos6, -home_pos1, -visiting_pos5, -visiting_pos6, -visiting_pos1, -home_libero, -visiting_libero, -serve_player_id)
+
+  return(data)
+}
+
+# Calculate RAPM dataframe
+get_rapm <- function(data) {
+  
+  # try removing games involving a team that has <=3 games in the data
+  rare_teams <- data %>%
+    group_by(match_id, team) %>%
+    summarize(n()) %>%
+    group_by(team) %>%
+    summarize(count = n()) %>%
+    filter(count <= 3)
+  
+  rare_matches <- data %>%
+    filter(team %in% rare_teams$team) %>%
+    group_by(match_id) %>%
+    summarize(count = n())
+  
+  # select columns and add point winner (Y in linear regression)
+  apm_points <- data %>%
+    filter(!match_id %in% rare_matches$match_id) %>%
+    select(match_id, point_id,
+           home_player_id1, home_player_id2, home_player_id3, home_player_id4, home_player_id5, home_player_id6,
+           visiting_player_id1, visiting_player_id2, visiting_player_id3, 
+           visiting_player_id4, visiting_player_id5, visiting_player_id6,
+           point_won_by, home_team, visiting_team) %>%
+    distinct() %>%
+    mutate(winner = ifelse(point_won_by == home_team, 1, 0)) %>%
+    select(-point_won_by, -home_team, -visiting_team) %>%
+    filter(!is.na(winner))
+  
+  # elongate the df, value of 1 for home players or -1 for visiting players
+  apm_long <- 
+    apm_points %>%
+      pivot_longer(cols = starts_with("home_player_id"), names_to = "role", values_to = "player_id") %>%
+      mutate(value = 1) %>% # Home players get +1
+    bind_rows(
+      apm_points %>%
+        pivot_longer(cols = starts_with("visiting_player_id"), names_to = "role", values_to = "player_id") %>%
+        mutate(value = -1) # Visiting players get -1
+    ) %>%
+    select(match_id, point_id, player_id, value, winner) %>%
+    filter(player_id != "unknown player") %>%
+    mutate(
+      plus_minus = case_when(
+        value == 1 & winner == 1 ~ 1,
+        value == 1 & winner == 0 ~ -1,
+        value == -1 & winner == 1 ~ -1,
+        value == -1 & winner == 0 ~ 1,
+        TRUE ~ NA)
+    ) %>%
+    mutate(player_id = as.character(player_id))
+  
+  # find combinations of match, point, player, winner, and plus-minus to get rid of them
+  duplicates <- apm_long %>%
+    group_by(match_id, point_id, player_id, winner, plus_minus) %>%
+    summarize(count = n()) %>%
+    filter(count == 2)
+
+  # get rid of duplicates
+  apm_long <- apm_long %>% anti_join(duplicates, by = c("match_id", "point_id"))
+  
+  # widen the df to get one row per point
+  apm_wide <- apm_long %>%
+    select(-plus_minus) %>%
+    pivot_wider(names_from = player_id, values_from = value, values_fill = 0) %>%
+    mutate(total = rowSums(select(., -(1:3)), na.rm = TRUE)) %>%
+    select(total, everything()) %>%
+    select(match_id, point_id, winner, total, everything())
+
+  # build ridge regression
+  X <- as.matrix(apm_wide %>% select(-match_id, -point_id, -winner, -total))
+  y <- apm_wide$winner
+  ridge_apm <- cv.glmnet(X, y, family = "binomial", alpha = 0)
+  
+  # grab coefficients
+  ridge_coefs <- coef(ridge_apm, s = "lambda.1se")
+  
+  # match players with ids
+  player_ids <- data %>%
+    group_by(player_id, player_name, team_short, position) %>%
+    summarize(n = n()) %>%
+    arrange(desc(n)) %>%
+    group_by(player_id, player_name, team_short) %>%
+    slice(1)
+  
+  # find sample sizes
+  player_sample <- apm_long %>%
+    mutate(player_id = as.character(player_id)) %>%
+    group_by(player_id) %>%
+    summarize(points = n())
+  
+  # put it all together
+  rapm <- data.frame(
+      id = gsub("`","",rownames(ridge_coefs)), 
+      ridge_APM = as.numeric(ridge_coefs)
+    ) %>%
+    filter(id != "(Intercept)") %>%
+    filter(!is.na(ridge_APM)) %>%
+    left_join(player_ids, by = c("id" = "player_id")) %>%
+    left_join(player_sample, by = c("id" = "player_id")) %>%
+    select(id, player_name, team_short, position, ridge_APM, points)
+  
+  return(rapm)
+
+}
+
+# Shrink RAPM values based on sample size and position
+shrink_rapm <- function(rapm) {
+  
+  # Step 1: compute position-specific shrinkage factors (excluding "unsure")
+  pos_shrink <- rapm %>%
+    filter(position != "unsure") %>%
+    group_by(position) %>%
+    summarize(
+      y_bar = weighted.mean(ridge_APM, points),
+      scale_factor = median(points)
+    ) %>%
+    ungroup()
+  
+  # Step 2: pull libero’s shrinkage values
+  libero_vals <- pos_shrink %>% filter(position == "libero")
+  
+  # Step 3: join shrinkage params to all players
+  rapm <- rapm %>%
+    left_join(pos_shrink, by = "position") %>%
+    mutate(
+      # if unsure, use libero values instead
+      y_bar = ifelse(position == "unsure", libero_vals$y_bar, y_bar),
+      scale_factor = ifelse(position == "unsure", libero_vals$scale_factor, scale_factor),
+      
+      shrink_weight = 1 - exp(-points / scale_factor),
+      RAPM = shrink_weight * ridge_APM + (1 - shrink_weight) * y_bar
+    ) %>%
+    select(-y_bar, -scale_factor)
+  
+  return(rapm)
+}
+
+# Combine these
+generate_rapm <- function(data) {
+  libero_data <- add_liberos(data)
+  rapm <- get_rapm(libero_data)
+  rapm <- shrink_rapm(rapm)
+  
+  list(
+    libero_data = libero_data,
+    rapm = rapm
+  )
+}
+
+# Evaluate RAPMs
+evaluate_rapm <- function(rapm) {
+  # plot how quickly this shrinkage occurs
+  shrinkage_rate <- ggplot(rapm, aes(x = points, y = shrink_weight)) +
+    geom_point() +
+    theme_minimal() +
+    labs(title = "Shrinkage of Ridge APM", x = "Sample Size", y = "Shrinkage Weight") +
+    theme(plot.title = element_text(hjust = 0.5))
+  
+  # plot the change of RAPM values
+  shrinkage_effect <- ggplot(rapm, aes(x = ridge_APM, y = RAPM, color = points)) +
+    geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "gray") +
+    geom_point() +
+    scale_color_viridis_c() +
+    theme_minimal() +
+    labs(title = "Shrinkage of Ridge APM", x = "Original Ridge APM", y = "RAPM After Shrinkage") +
+    theme(plot.title = element_text(hjust = 0.5))
+  
+  # evaluate RAPM success using All-American Awards
+  npoy_finalists <- rapm %>%
+    filter(player_name %in% c("Olivia Babcock", "Brooklyn Deleye", "Sarah Franklin", "Lexi Rodriguez")) %>%
+    summarize(mean(RAPM)) %>%
+    pull()
+  
+  first_team <- rapm %>%
+    filter(player_name %in% c("Olivia Babcock", "Brooklyn Deleye", "Rachel Fairbanks", "Sarah Franklin", "Andi Jackson", "Kennedy Martin", "Kami Miner", "Jess Mruzik", "Melanie Parra", "Lexi Rodriguez", "Elia Rubin", "Elena Scott", "Torrey Stafford", "Kendra Wait")) %>%
+    summarize(mean(RAPM)) %>%
+    pull()
+  
+  second_team <- rapm %>%
+    filter(player_name %in% c("Nina Cajic", "Raven Colvin", "Mimi Colyer", "Anna Debeer", "Sami Francis", "Emma Grome", "Eva Hudson", "Bre Kelley", "Logan Lednicky", "Harper Murray", "Bergen Reilly", "Madisen Skinner", "Izzy Starck",
+                              "Norah Sis")) %>%
+    summarize(mean(RAPM)) %>%
+    pull()
+  
+  third_team <- rapm %>%
+    filter(player_name %in% c("Charlie Fuerbringer", "Flormarie Heredia", "Audrey Koenig", "Khori Louis", "Onye Ofoegbu", "Alexis Shelton", "Naya Shime", "Raina Terry", "Mia Tuaniga", "Camryn Turner", "Argentina Ung", "Mychael Vernon",
+                              "Lexie Almodovar", "Ava Martin")) %>%
+    summarize(mean(RAPM)) %>%
+    pull()
+  
+  honorable_mention <- rapm %>%
+    filter(player_name %in% c("Ally Batenhorst", "Bianca Bertolino", "Ifenna Cos-Okpalla", "Cara Cresse", "Celia Cullen", "Geli Cyr", "Kamryn Gibadlo", "Cam Hannah", "Julia Hanson", "Jordan Iliff", "Claire Jeter", "Caroline Kerr", "Cheridyn Leverette", "Claire Little", "Grace Lopez", "Charitie Luper", "Elise McGhee", "Michelle Ohwobete", "Toyosi Onabanjo", "Maya Sands", "Melanie Shaffmaster", "Mary Shroll", "Taylor Trammell", "Nia Washington", "Riley Whitesides", "Kira Fallert",
+                              "Caylen Alexander", "Yadhira Anchante", "Maria Clara Andrade", "Milan Bayless", "Maddy Bilinovic", "Kamryn Chaney", "Syd Cole", "Kaylee Cox", "Macy Daufeldt", "Alexa Edwards", "Skye Ekes", "Brianna Ford", "Elena Giacomini", "Elise Goetzinger", "Tori Hester", "Cicily Hidalgo", "Lauryn Hovey", "Tsvetelina Ilieva", "Madolyn Isringhausen", "Malaya Jones", "shelby Kent", "Patrycja Lagida", "Dylan Maberry", "Rya McKinnon", "Kylee Owens", "Panna Ratkai", "Amanda Rice", "Kaya Weaver", "Sylvie Zgnoc")) %>%
+    summarize(mean(RAPM)) %>%
+    pull()
+  
+  all_americans <- ggplot(rapm, aes(RAPM)) +
+    geom_histogram(fill = "steelblue", color = "black") +
+    geom_vline(xintercept = npoy_finalists, color = "black", linetype = "dashed", linewidth = 1.25) +
+    geom_vline(xintercept = first_team, color = "gold", linetype = "dashed", linewidth = 1.25) +
+    geom_vline(xintercept = second_team, color = "#C0C0C0", linetype = "dashed", linewidth = 1.25) +
+    geom_vline(xintercept = third_team, color = "#CD7F32", linetype = "dashed", linewidth = 1.25) +
+    geom_vline(xintercept = honorable_mention, color = "firebrick", linetype = "dashed", linewidth = 1.25) +
+    labs(title = "Distribution of RAPM Values", x = "RAPM Value", y = "") +
+    theme_minimal() +
+    theme(plot.title = element_text(hjust = 0.5))
+  
+  list(
+    shrinkage_rate = shrinkage_rate,
+    shrinkage_effect = shrinkage_effect,
+    all_americans = all_americans
+  )
+}
+```
+
+```{r}
+# get a list of players that touched the ball during each rally
+touches <- data %>%
+  select(match_id, point_id, player_id) %>%
+  distinct() %>%
+  mutate(touch = 1)
+
+# only keep the players in each point that touched the ball in that rally
+apm_long <- apm_long %>%
+  left_join(touches, by = c("match_id", "point_id", "player_id")) %>%
+  filter(touch == 1) %>%
+  select(-touch)
+```
+
+
+```{r}
+rapm_result <- generate_rapm(power)
+rapm <- rapm_result$rapm
+print(head(rapm_result$libero_data))
+print(head(rapm_result$rapm))
+```
+
+```{r}
+rapm_eval <- evaluate_rapm(rapm_result$rapm)
+rapm_eval$shrinkage_rate
+rapm_eval$shrinkage_effect
+rapm_eval$all_americans
+```
+
+
+
+WAYS TO IMPROVE THIS PROCESS
+1. 
+
+```{r}
+# Identify which players were on court and their positions for a team
+get_on_court_data <- function(data, team_name) {
+  data %>%
+    mutate(player_id = as.character(player_id)) %>%  # <-- FIX here
+    filter(team == team_name) %>%
+    select(match_id, point_id, starts_with("home_player_id"), starts_with("visiting_player_id"),
+           home_team, visiting_team) %>%
+    pivot_longer(cols = starts_with("home_player_id") | starts_with("visiting_player_id"),
+                 names_to = "player_slot", values_to = "player_id") %>%
+    distinct(match_id, point_id, player_id) %>%
+    mutate(player_id = as.character(player_id)) %>%  # <-- ensure type match before join
+    left_join(data %>%
+                mutate(player_id = as.character(player_id)) %>%
+                select(match_id, point_id, player_id, position) %>%
+                distinct(), 
+              by = c("match_id", "point_id", "player_id")) %>%
+    filter(!is.na(position)) %>%
+    distinct(match_id, point_id, player_id, position)
+}
+
+# Detect system type (5-1 vs 6-2)
+detect_system <- function(on_court_data, team_name) {
+  # Filter to the target team
+  team_on_court <- on_court_data %>%
+    filter(team_short == team_name, position == "Setter")
+
+  # Count number of rallies each setter was on court
+  setter_usage <- team_on_court %>%
+    count(player_id, name = "rallies") %>%
+    mutate(share = rallies / sum(rallies))
+
+  if (nrow(setter_usage) == 1 || max(setter_usage$share) > 0.8) {
+    return("5-1")
+  } else if (
+    nrow(setter_usage) == 2 &&
+    all(setter_usage$share > 0.3 & setter_usage$share < 0.7)
+  ) {
+    return("6-2")
+  } else {
+    return("Unknown")
+  }
+}
+
+# Build the starting lineup based on the identified system type
+build_lineup <- function(data, team_name, system) {
+  team_data <- data %>%
+    filter(team_short == team_name) %>%
+    mutate(player_id = as.character(player_id))
+
+  # Count player usage by position
+  top_by_position <- team_data %>%
+    count(position, player_id, player_name, sort = TRUE) %>%
+    group_by(position) %>%
+    arrange(desc(n)) %>%
+    ungroup()
+
+  # Define how many players per position for each system
+  position_quota <- switch(system,
+  "5-1" = c(Setter = 1, Outside = 2, Opposite = 1, Middle = 2, "L/DS" = 3),
+  "6-2" = c(Setter = 2, Outside = 2, Opposite = 2, Middle = 2, "L/DS" = 3),
+  {
+    message("Unknown system — defaulting to 5–1")
+    c(Setter = 1, Outside = 2, Opposite = 1, Middle = 2, "L/DS" = 3)
+  }
+  )
+
+  # Build lineup by taking top N from each position
+  lineup <- map_df(names(position_quota), function(pos) {
+    n_needed <- position_quota[[pos]]
+    
+    top_by_position %>%
+      filter(position == pos, n > 0.1 * max(n)) %>%
+      slice_head(n = n_needed) %>%
+      mutate(pos = case_when(
+        pos == "Setter" ~ paste0("S", row_number()),
+        pos == "Outside" ~ paste0("OH", row_number()),
+        pos == "Opposite" ~ paste0("OPP", row_number()),
+        pos == "Middle" ~ paste0("MB", row_number()),
+        pos == "L/DS" & row_number() == 1 ~ "L",
+        pos == "L/DS" & row_number() > 1 ~ paste0("DS", row_number() - 1),
+        TRUE ~ pos  # fallback
+      )) %>%
+      select(position, pos, player_id, player_name, n)
+  })
+  
+  # Only modify if system is 6-2
+  if (system == "6-2") {
+    servers <- data %>%
+      filter(team_short == team_name, skill == "Serve") %>%
+      distinct(player_id)
+
+    # Check whether each relevant player is in servers
+    opp1_id <- lineup %>% filter(pos == "OPP1") %>% pull(player_id)
+    opp2_id <- lineup %>% filter(pos == "OPP2") %>% pull(player_id)
+    s1_id   <- lineup %>% filter(pos == "S1") %>% pull(player_id)
+    s2_id   <- lineup %>% filter(pos == "S2") %>% pull(player_id)
+
+    s1_serves   <- s1_id %in% servers$player_id
+    s2_serves   <- s2_id %in% servers$player_id
+    opp1_serves <- opp1_id %in% servers$player_id
+    opp2_serves <- opp2_id %in% servers$player_id
+
+    if ((s1_serves && opp1_serves) || (s2_serves && opp2_serves)) {
+      lineup <- lineup %>%
+        mutate(pos = case_when(
+          pos == "OPP1" ~ "OPP2_temp",
+          pos == "OPP2" ~ "OPP1",
+          pos == "OPP2_temp" ~ "OPP2",
+          TRUE ~ pos
+        )) %>%
+        mutate(pos = ifelse(pos == "OPP2_temp", "OPP2", pos))
+    }
+  }
+
+  return(lineup)
+}
+
+# Find the 6 most common servers for a team
+get_servers <- function(data, team_name) {
+  data %>%
+    filter(team_short == team_name, skill == "Serve") %>%
+    count(player_id, player_name, sort = TRUE) %>%
+    slice_head(n = 6)
+}
+
+# Define which pin hitters play back row as well
+get_back_row <- function(data, team_name) {
+  players <- power %>%
+    filter(team_short == team_name) %>%
+    select(player_id, player_name) %>%
+    distinct()
+    
+  power %>%
+    mutate(home_team_short = ifelse(team == home_team, team_short, NA)) %>%
+    filter(home_team_short == team_name) %>%
+    select(match_id, point_id, starts_with("home_player_id")) %>%
+    pivot_longer(cols = starts_with("home_player_id"),
+                 names_to = "rotation", values_to = "rotation_player_id") %>%
+    distinct() %>%
+    mutate(rotation_player_id = as.character(rotation_player_id)) %>%
+    left_join(players, by = c("rotation_player_id" = "player_id")) %>%
+    mutate(player_id = rotation_player_id) %>%
+    filter(!is.na(player_name)) %>%
+    group_by(player_id, player_name, rotation) %>%
+    summarize(n = n()) %>%
+    pivot_wider(names_from = rotation, values_from = n, values_fill = 0) %>%
+    mutate(back_row = ifelse(
+      sum(home_player_id5, home_player_id6)/2 > 
+        0.4*sum(home_player_id2, home_player_id3, home_player_id4)/3, 
+      TRUE, FALSE
+    ))
+}
+
+# Convert the starting lineup into the 6 players on the court in each rotation
+get_rotation_lineup <- function(lineup, system) {
+  
+  system <- ifelse(system == "Unknown", "5-1", system)
+  
+  # Define rotation patterns for each system
+  rotation_map <- switch(system,
+    "5-1" = list(
+      Ro1 = c(Pos1 = "S1",  Pos2 = "OH1", Pos3 = "MB2", Pos4 = "OPP1", Pos5 = "OH2", Pos6 = "L"),
+      Ro2 = c(Pos1 = "OH1", Pos2 = "MB2", Pos3 = "OPP1", Pos4 = "OH2", Pos5 = "L", Pos6 = "S1"),
+      Ro3 = c(Pos1 = "MB2", Pos2 = "OPP1", Pos3 = "OH2", Pos4 = "MB1", Pos5 = "S1",  Pos6 = "OH1"),
+      Ro4 = c(Pos1 = "OPP1", Pos2 = "OH2", Pos3 = "MB1", Pos4 = "S1",  Pos5 = "OH1", Pos6 = "L"),
+      Ro5 = c(Pos1 = "OH2", Pos2 = "MB1", Pos3 = "S1",  Pos4 = "OH1", Pos5 = "L", Pos6 = "OPP1"),
+      Ro6 = c(Pos1 = "MB1", Pos2 = "S1",  Pos3 = "OH1", Pos4 = "MB2", Pos5 = "OPP1", Pos6 = "OH2")
+    ),
+    "6-2" = list(
+      Ro1 = c(Pos1 = "S1",  Pos2 = "OH1", Pos3 = "MB2", Pos4 = "OPP2", Pos5 = "OH2", Pos6 = "L"),
+      Ro2 = c(Pos1 = "OH1", Pos2 = "MB2", Pos3 = "OPP2", Pos4 = "OH2", Pos5 = "L", Pos6 = "S1"),
+      Ro3 = c(Pos1 = "MB2", Pos2 = "OPP2", Pos3 = "OH2", Pos4 = "MB1", Pos5 = "S1",  Pos6 = "OH1"),
+      Ro4 = c(Pos1 = "S2",  Pos2 = "OH2", Pos3 = "MB1", Pos4 = "OPP1", Pos5 = "OH1", Pos6 = "L"),
+      Ro5 = c(Pos1 = "OH2", Pos2 = "MB1", Pos3 = "OPP1", Pos4 = "OH1", Pos5 = "L", Pos6 = "S2"),
+      Ro6 = c(Pos1 = "MB1", Pos2 = "OPP1", Pos3 = "OH1", Pos4 = "MB2", Pos5 = "S2",  Pos6 = "OH2")
+    ),
+    stop("Unknown system")
+  )
+
+  # Build rotation lineups
+  map_dfr(names(rotation_map), function(rotation) {
+    positions <- rotation_map[[rotation]]
+
+    players <- map_chr(positions, function(pos_label) {
+      lineup %>%
+        filter(pos == pos_label) %>%
+        pull(player_name) %>%
+        first()  # In case of duplicates
+    })
+
+    tibble(
+      rotation = rotation,
+      Pos1 = players[1],
+      Pos2 = players[2],
+      Pos3 = players[3],
+      Pos4 = players[4],
+      Pos5 = players[5],
+      Pos6 = players[6]
+    )
+  })
+}
+
+# Adjust the servers in this rotation lineup
+adjust_servers <- function(rotation_lineup, servers, system, lineup) {
+  safe_first <- function(x) if (length(x) == 0) NA_character_ else x[1]
+
+  server_names <- servers$player_name
+
+  server_positions <- servers %>% select(pos, player_name)
+  ds1_name <- safe_first(server_positions %>% filter(pos == "DS1") %>% pull(player_name))
+  ds2_name <- safe_first(server_positions %>% filter(pos == "DS2") %>% pull(player_name))
+  l_name   <- safe_first(server_positions %>% filter(pos == "L") %>% pull(player_name))
+
+  oh1_serves <- "OH1" %in% servers$pos
+  oh2_serves <- "OH2" %in% servers$pos
+  ds1_serves <- "DS1" %in% servers$pos
+  ds2_serves <- "DS2" %in% servers$pos
+
+  name_to_pos <- lineup %>% select(player_name, pos)
+
+  mb1_serves <- "MB1" %in% servers$pos
+  mb2_serves <- "MB2" %in% servers$pos
+  both_mbs_dont_serve <- !(mb1_serves || mb2_serves)
+
+  # Initial substitutions
+  adjusted <- rotation_lineup %>%
+    rowwise() %>%
+    mutate(Pos1 = {
+      lineup_pos <- name_to_pos %>%
+        filter(player_name == Pos1) %>%
+        pull(pos) %>%
+        safe_first()
+
+      if (Pos1 %in% server_names) {
+        Pos1
+      
+      } else if (lineup_pos %in% c("MB1", "MB2")) {
+        if (lineup_pos == "MB1") {
+          if (!mb1_serves && !is.na(l_name) && l_name %in% server_names) {
+            # MB1 doesn't serve, and L is available
+            l_name
+          } else {
+            # Keep MB1
+            Pos1
+          }
+        } else if (lineup_pos == "MB2") {
+          if (!mb2_serves && mb1_serves && !is.na(l_name) && l_name %in% server_names) {
+            # MB2 doesn't serve, MB1 does, and L is available
+            l_name
+          } else {
+            # Keep MB2
+            Pos1
+          }
+        } else {
+          Pos1
+        }
+
+      } else if (system == "5-1") {
+        case_when(
+          lineup_pos == "OH1" & ds1_serves ~ ds1_name,
+          lineup_pos == "OH2" & !oh1_serves & ds2_serves ~ ds2_name,
+          lineup_pos == "OH2" & oh1_serves & ds1_serves ~ ds1_name,
+          lineup_pos == "OPP1" & oh1_serves & oh2_serves & ds1_serves ~ ds1_name,
+          lineup_pos == "OPP1" & ds2_serves ~ ds2_name,
+          TRUE ~ Pos1
+        )
+
+      } else if (system == "6-2") {
+        case_when(
+          lineup_pos == "S1" ~ safe_first(servers %>% filter(pos == "OPP1") %>% pull(player_name)),
+          lineup_pos == "S2" ~ safe_first(servers %>% filter(pos == "OPP2") %>% pull(player_name)),
+          lineup_pos == "OH1" & ds1_serves ~ ds1_name,
+          lineup_pos == "OH2" & !oh1_serves & ds2_serves ~ ds2_name,
+          lineup_pos == "OH2" & oh1_serves & ds1_serves ~ ds1_name,
+          TRUE ~ Pos1
+        )
+
+      } else {
+        Pos1
+      }
+    }) %>%
+    ungroup()
+
+  # ------------------------
+  # Final substitutions step
+  # ------------------------
+
+  # 1. Determine unused servers
+  used_names <- adjusted$Pos1
+  unused_servers <- servers %>%
+    filter(!(player_name %in% used_names)) %>%
+    pull(player_name)
+
+  # 2. Identify Pos1s to consider for replacement (OH, OPP who don’t serve)
+  name_to_pos <- name_to_pos %>% distinct()
+  candidates <- adjusted %>%
+    left_join(name_to_pos, by = c("Pos1" = "player_name")) %>%
+    filter(pos %in% c("OH1", "OH2", "OPP1", "OPP2"), !(Pos1 %in% server_names))
+
+  # 3. Replace non-serving OH/OPP with unused servers
+  if (length(unused_servers) > 0 && nrow(candidates) > 0) {
+    for (i in seq_len(nrow(candidates))) {
+      old_name <- candidates$Pos1[i]
+      new_name <- safe_first(setdiff(unused_servers, adjusted$Pos1))
+
+      if (!is.na(new_name)) {
+        adjusted$Pos1[adjusted$Pos1 == old_name] <- new_name
+      }
+    }
+  }
+  
+  # Step 1: Identify non-server Pos1s
+  non_servers <- which(!(adjusted$Pos1 %in% server_names))
+
+  # Step 2: Get available servers not already in Pos1
+  used <- adjusted$Pos1
+  available <- setdiff(server_names, used)
+
+  # Step 3: Replace at most two non-server Pos1s with available servers
+  for (i in seq_along(non_servers)) {
+    if (i > length(available)) break  # Stop if we run out of servers
+
+    row_idx <- non_servers[i]
+    adjusted$Pos1[row_idx] <- available[i]
+  }
+
+  return(adjusted)
+}
+
+# Adjust the back row in this rotation lineup
+adjust_back_row <- function(server_adj, lineup) {
+  # Create lookup for back_row by player
+  lineup_backrow <- lineup %>% select(player_name, pos, back_row)
+
+  # Define rotation order
+  rotation_order <- c("Ro1", "Ro2", "Ro3", "Ro4", "Ro5", "Ro6")
+  
+  # Lookup table for previous rotations
+  prev_rotation <- setNames(c("Ro6", "Ro1", "Ro2", "Ro3", "Ro4", "Ro5"), rotation_order)
+  prev_rotation2 <- setNames(c("Ro5", "Ro6", "Ro1", "Ro2", "Ro3", "Ro4"), rotation_order)
+
+  # Join back row info for Pos5 and Pos6
+  server_adj <- server_adj %>%
+    left_join(lineup_backrow, by = c("Pos6" = "player_name")) %>%
+    rename(pos6 = pos, back6 = back_row) %>%
+    left_join(lineup_backrow, by = c("Pos5" = "player_name")) %>%
+    rename(pos5 = pos, back5 = back_row)
+
+  # Adjust Pos6 and Pos5
+  server_adj <- server_adj %>%
+    rowwise() %>%
+    mutate(
+      Pos6 = {
+        if (pos6 %in% c("L", "S1", "S2")) {
+          Pos6
+        } else if (pos6 %in% c("OH1", "OH2", "OPP1") && isFALSE(back6)) {
+          prev_rot <- prev_rotation[[rotation]]
+          sub <- server_adj %>%
+            filter(rotation == prev_rot) %>%
+            pull(Pos1) %>%
+            first()
+          if (!is.na(sub)) sub else Pos6
+        } else {
+          Pos6
+        }
+      },
+      Pos5 = {
+        if (pos5 %in% c("L", "S1", "S2")) {
+          Pos5
+        } else if (pos5 %in% c("OH1", "OH2", "OPP1") && isFALSE(back5)) {
+          prev_rot2 <- prev_rotation2[[rotation]]
+          sub <- server_adj %>%
+            filter(rotation == prev_rot2) %>%
+            pull(Pos1) %>%
+            first()
+          if (!is.na(sub)) sub else Pos5
+        } else {
+          Pos5
+        }
+      }
+    ) %>%
+    ungroup() %>%
+    select(-pos6, -back6, -pos5, -back5)
+
+  return(server_adj)
+}
+
+
+# Combine it all
+generate_starting_lineup <- function(data, team_name) {
+  system <- detect_system(data, team_name)
+  lineup <- build_lineup(data, team_name, system) %>% 
+    left_join(get_back_row(data, team_name) %>% select(player_id, player_name, back_row)) %>%
+    mutate(back_row = ifelse(position %in% c("Outside", "Opposite"), back_row, NA))
+  servers <- get_servers(data, team_name) %>%
+    left_join(lineup %>% select(player_name, position, pos), by = "player_name")
+  back_row <- get_back_row(data, team_name)
+  rotation_lineup <- get_rotation_lineup(lineup, system)
+  server_adj <- adjust_servers(rotation_lineup, servers, system, lineup)
+  final_rot_lineup <- adjust_back_row(server_adj, lineup)
+  
+  list(
+    team_short = team_name,
+    system = system,
+    lineup = lineup,
+    servers = servers,
+    back_row = back_row,
+    rotation_lineup = rotation_lineup,
+    server_adj = server_adj,
+    final_rot_lineup = final_rot_lineup
+  )
+}
+```
+
+```{r}
+result <- generate_starting_lineup(power, "byu")
+cat("System detected:", result$system, "\n")
+print(result$lineup)
+print(result$servers)
+print(result$final_rot_lineup)
+```
+
+
+
+
+WAYS TO IMPROVE THIS PROCESS
+1. 
+
+```{r}
+# Use a Bradley-Terry model to quantify the advantage of playing at home
+get_home_advantage <- function(data) {
+  shortenings <- data %>%
+    select(team, team_short) %>%
+    distinct()
+  
+  home_away_matrix <- data %>%
+    filter(!is.na(conference), !is.na(opp_conference), conference == opp_conference) %>%
+    select(match_id, team, opponent, home_team) %>%
+    distinct() %>%
+    mutate(team_home_away = ifelse(team == home_team, "home", "away")) %>%
+    left_join(shortenings, by = c("opponent" = "team")) %>%
+    rename(opp_short = team_short) %>%
+    left_join(shortenings, by = "team") %>%
+    select(match_id, team_short, opp_short, team_home_away) %>% 
+    mutate(team_home_away_value = ifelse(team_home_away == "home", 1, -1)) %>%
+    pivot_wider(names_from = team_short, values_from = team_home_away_value) %>%
+    group_by(match_id) %>%
+    summarise_at(vars(-opp_short, -team_home_away), sum, na.rm = TRUE)
+    
+  home_team_win <- data %>%
+    filter(!is.na(conference), !is.na(opp_conference), conference == opp_conference) %>%
+    group_by(match_id) %>%
+    arrange(match_id, desc(row_number())) %>%
+    slice(1) %>%
+    ungroup() %>%
+    select(match_id, home_team, visiting_team, point_won_by) %>%
+    mutate(home_team_win = ifelse(home_team == point_won_by, 1, 0)) %>%
+    select(match_id, home_team_win)
+  
+  home_advantage <- inner_join(home_away_matrix, home_team_win, by = "match_id")
+  
+  bt_model <- glm(home_team_win ~ . -match_id, family = binomial, data = home_advantage)
+  home_advantage <- as.numeric(coef(bt_model)["(Intercept)"])
+  
+  return(home_advantage)
+}
+
+# Quantify the advantage of being the sideout team
+get_sideout_advantage <- function(data) {
+  sideout_rate <- data %>%
+    filter(skill == "Serve") %>%
+    summarize(rate = mean(point_won_by != serving_team)) %>%
+    pull(rate)
+  
+  sideout_advantage <- log(sideout_rate / (1 - sideout_rate))
+  
+  return(sideout_advantage)
+}
+
+# Find each team's most common starting rotation
+get_starting_rotation <- function(data) {
+  start_rot_data <- data %>%
+    group_by(set_id) %>%
+    filter(point_id == min(point_id)) %>%
+    ungroup() %>%
+    mutate(setter_position = ifelse(team == home_team, home_setter_position, visiting_setter_position)) %>%
+    distinct(team_short, set_id, setter_position) %>%
+    group_by(team_short) %>%
+    summarize(
+      Ro1 = sum(setter_position == 1),
+      Ro2 = sum(setter_position == 2),
+      Ro3 = sum(setter_position == 3),
+      Ro4 = sum(setter_position == 4),
+      Ro5 = sum(setter_position == 5),
+      Ro6 = sum(setter_position == 6)
+    ) %>%
+    rowwise() %>%
+    mutate(start_rot = names(across(Ro1:Ro6))[which.max(c_across(Ro1:Ro6))]) %>%
+    ungroup()
+  
+  return(start_rot_data)
+}
+
+# Attach RAPMs to each rotation for each team and combine into one data set
+combine_teams <- function(data, teamA, teamB) {
+  teamA <- generate_starting_lineup(data, teamA)$final_rot_lineup %>% mutate(team = teamA) %>% select(team, everything())
+  teamB <- generate_starting_lineup(data, teamB)$final_rot_lineup %>% mutate(team = teamB) %>% select(team, everything())
+  
+  teamA <- teamA %>%
+    left_join(rapm %>% select(player_name, RAPM), by = c("Pos1" = "player_name")) %>% rename(rapm1 = RAPM) %>%
+    left_join(rapm %>% select(player_name, RAPM), by = c("Pos2" = "player_name")) %>% rename(rapm2 = RAPM) %>%
+    left_join(rapm %>% select(player_name, RAPM), by = c("Pos3" = "player_name")) %>% rename(rapm3 = RAPM) %>%
+    left_join(rapm %>% select(player_name, RAPM), by = c("Pos4" = "player_name")) %>% rename(rapm4 = RAPM) %>%
+    left_join(rapm %>% select(player_name, RAPM), by = c("Pos5" = "player_name")) %>% rename(rapm5 = RAPM) %>%
+    left_join(rapm %>% select(player_name, RAPM), by = c("Pos6" = "player_name")) %>% rename(rapm6 = RAPM) %>%
+    mutate(rotation_rapm = rowSums(across(rapm1:rapm6)))
+  
+  teamB <- teamB %>%
+    left_join(rapm %>% select(player_name, RAPM), by = c("Pos1" = "player_name")) %>% rename(rapm1 = RAPM) %>%
+    left_join(rapm %>% select(player_name, RAPM), by = c("Pos2" = "player_name")) %>% rename(rapm2 = RAPM) %>%
+    left_join(rapm %>% select(player_name, RAPM), by = c("Pos3" = "player_name")) %>% rename(rapm3 = RAPM) %>%
+    left_join(rapm %>% select(player_name, RAPM), by = c("Pos4" = "player_name")) %>% rename(rapm4 = RAPM) %>%
+    left_join(rapm %>% select(player_name, RAPM), by = c("Pos5" = "player_name")) %>% rename(rapm5 = RAPM) %>%
+    left_join(rapm %>% select(player_name, RAPM), by = c("Pos6" = "player_name")) %>% rename(rapm6 = RAPM) %>%
+    mutate(rotation_rapm = rowSums(across(rapm1:rapm6)))
+  
+  rotation_rapms <- rbind(teamA, teamB)
+  
+  return(rotation_rapms)
+}
+```
+
+```{r}
+get_home_advantage(power)
+get_sideout_advantage(power)
+get_starting_rotation(power) %>% head()
+combine_teams(power, "texas", "nebraska")
+```
+
+
+
+WAYS TO IMPROVE THIS PROCESS
+1. Improve computational intensity
+
+```{r}
+# SIMULATE!!
+simulate <- function(data, teamA, teamB, location) {
+  
+  # Load starting rotations (fixed for all matches)
+  start_rotationA <- get_starting_rotation(data) %>% filter(team_short == teamA) %>% pull(start_rot)
+  start_rotationB <- get_starting_rotation(data) %>% filter(team_short == teamB) %>% pull(start_rot)
+  
+  # Get RAPM table
+  rotation_rapms <- combine_teams(data, teamA, teamB)
+  
+  # Sideout advantage
+  sideout_adv <- get_sideout_advantage(data)
+  
+  # Rotation order for tracking
+  rotation_order <- c("Ro1", "Ro6", "Ro5", "Ro4", "Ro3", "Ro2")
+  
+  # Store match data
+  matches <- list()
+  match_num <- 1
+  
+  for (i in 1:1000) {
+    
+    # Initialize match state
+    set <- 1
+    scoreA <- 0
+    scoreB <- 0
+    setwinsA <- 0
+    setwinsB <- 0
+  
+    # Store rally data
+    rallies <- list()
+    rally_num <- 1
+    
+    while (setwinsA < 3 && setwinsB < 3) {
+      # Determine set point target
+      point_target <- ifelse(set == 5, 15, 25)
+    
+      # Reset set scores and randomly choose serving team
+      scoreA <- 0
+      scoreB <- 0
+      serving <- sample(c("A", "B"), size = 1)
+    
+      # Reset to original starting rotations
+      rotationA <- start_rotationA
+      rotationB <- start_rotationB
+    
+    # Simulate set
+      while (!(max(scoreA, scoreB) >= point_target && abs(scoreA - scoreB) >= 2)) {
+        # Store who is serving and rotations at start of rally
+        serving_start <- serving
+        rotationA_point <- rotationA
+        rotationB_point <- rotationB
+    
+        # Get RAPMs
+        rapm_A <- rotation_rapms %>% filter(team == teamA, rotation == rotationA_point) %>% pull(rotation_rapm)
+        rapm_B <- rotation_rapms %>% filter(team == teamB, rotation == rotationB_point) %>% pull(rotation_rapm)
+    
+        # Compute probability of team A winning the point
+        value <- rapm_A - rapm_B
+        value <- value + ifelse(serving_start == "B", sideout_adv, -sideout_adv)
+        prob_A_win <- exp(value) / (1 + exp(value))
+    
+        # Simulate point
+        point_winner <- ifelse(runif(1) < prob_A_win, "A", "B")
+    
+        # Update scores
+        if (point_winner == "A") {
+          scoreA <- scoreA + 1
+        } else {
+          scoreB <- scoreB + 1
+        }
+    
+        # Update rotations if sideout occurred
+        if (point_winner != serving_start) {
+          if (serving_start == "A") {
+            idx <- match(rotationB, rotation_order)
+            rotationB <- rotation_order[(idx %% 6) + 1]
+          } else {
+            idx <- match(rotationA, rotation_order)
+            rotationA <- rotation_order[(idx %% 6) + 1]
+          }
+          serving <- point_winner
+        }
+    
+        # Store rally
+        rallies[[rally_num]] <- data.frame(
+          set = set,
+          rally = rally_num,
+          serving_team = serving_start,
+          prob_A_win = prob_A_win,
+          point_winner = point_winner,
+          scoreA = scoreA,
+          scoreB = scoreB,
+          rotationA_point = rotationA_point,
+          rotationB_point = rotationB_point
+        )
+        rally_num <- rally_num + 1
+      }
+    
+      # Update set wins
+      if (scoreA > scoreB) {
+        setwinsA <- setwinsA + 1
+      } else {
+        setwinsB <- setwinsB + 1
+      }
+    
+      set <- set + 1
+    }
+    
+    # Combine all rallies into a single data frame
+    match_sim <- dplyr::bind_rows(rallies)
+  
+    scoreA_set1 <- match_sim %>% filter(set == 1) %>% 
+      { if (nrow(.) == 0) NA else slice_tail(., n = 1) %>% pull(scoreA) }
+    scoreA_set2 <- match_sim %>% filter(set == 2) %>% 
+      { if (nrow(.) == 0) NA else slice_tail(., n = 1) %>% pull(scoreA) }
+    scoreA_set3 <- match_sim %>% filter(set == 3) %>% 
+      { if (nrow(.) == 0) NA else slice_tail(., n = 1) %>% pull(scoreA) }
+    scoreA_set4 <- match_sim %>% filter(set == 4) %>% 
+      { if (nrow(.) == 0) NA else slice_tail(., n = 1) %>% pull(scoreA) }
+    scoreA_set5 <- match_sim %>% filter(set == 5) %>% 
+      { if (nrow(.) == 0) NA else slice_tail(., n = 1) %>% pull(scoreA) }
+    scoreB_set1 <- match_sim %>% filter(set == 1) %>% 
+      { if (nrow(.) == 0) NA else slice_tail(., n = 1) %>% pull(scoreB) }
+    scoreB_set2 <- match_sim %>% filter(set == 2) %>% 
+      { if (nrow(.) == 0) NA else slice_tail(., n = 1) %>% pull(scoreB) }
+    scoreB_set3 <- match_sim %>% filter(set == 3) %>% 
+      { if (nrow(.) == 0) NA else slice_tail(., n = 1) %>% pull(scoreB) }
+    scoreB_set4 <- match_sim %>% filter(set == 4) %>% 
+      { if (nrow(.) == 0) NA else slice_tail(., n = 1) %>% pull(scoreB) }
+    scoreB_set5 <- match_sim %>% filter(set == 5) %>% 
+      { if (nrow(.) == 0) NA else slice_tail(., n = 1) %>% pull(scoreB) }
+    winner <- match_sim %>% slice_tail(n = 1) %>% pull(point_winner)
+    
+    # Store rally
+    matches[[match_num]] <- data.frame(
+      winner = winner,
+      scoreA_set1 = scoreA_set1,
+      scoreA_set2 = scoreA_set2,
+      scoreA_set3 = scoreA_set3,
+      scoreA_set4 = scoreA_set4,
+      scoreA_set5 = scoreA_set5,
+      scoreB_set1 = scoreB_set1,
+      scoreB_set2 = scoreB_set2,
+      scoreB_set3 = scoreB_set3,
+      scoreB_set4 = scoreB_set4,
+      scoreB_set5 = scoreB_set5
+    )
+    
+    match_num <- match_num + 1
+  }
+  
+  # Combine all matches into a single data frame
+  probability_sim <- dplyr::bind_rows(matches) %>%
+    mutate(
+      winner_set1 = case_when(
+        scoreA_set1 > scoreB_set1 ~ "A",
+        scoreA_set1 < scoreB_set1 ~ "B",
+        is.na(scoreA_set1) | is.na(scoreB_set1) ~ NA
+      ),
+      winner_set2 = case_when(
+        scoreA_set2 > scoreB_set2 ~ "A",
+        scoreA_set2 < scoreB_set2 ~ "B",
+        is.na(scoreA_set2) | is.na(scoreB_set2) ~ NA
+      ),
+      winner_set3 = case_when(
+        scoreA_set3 > scoreB_set3 ~ "A",
+        scoreA_set3 < scoreB_set3 ~ "B",
+        is.na(scoreA_set3) | is.na(scoreB_set3) ~ NA
+      ),
+      winner_set4 = case_when(
+        scoreA_set4 > scoreB_set4 ~ "A",
+        scoreA_set4 < scoreB_set4 ~ "B",
+        is.na(scoreA_set4) | is.na(scoreB_set4) ~ NA
+      ),
+      winner_set5 = case_when(
+        scoreA_set5 > scoreB_set5 ~ "A",
+        scoreA_set5 < scoreB_set5 ~ "B",
+        is.na(scoreA_set5) | is.na(scoreB_set5) ~ NA
+      )
+    )
+  
+  home_adv <- get_home_advantage(data)
+  
+  # if (location == "neutral") {
+  #   teamA_winprob <- probability_sim %>% summarize(teamA_winprob = mean(winner == "A")) %>% pull()
+  #   
+  # } else if (location == "A") {
+  #   neutralA_winprob <- probability_sim %>% summarize(neutralA_winprob = mean(winner == "A")) %>% pull()
+  #   neutralA_logodds <- log(neutralA_winprob / (1 - neutralA_winprob))
+  #   value <- neutralA_logodds + home_adv
+  #   teamA_winprob <- exp(value) / (1 + exp(value))
+  #   
+  # } else if (location == "B") {
+  #   neutralA_winprob <- probability_sim %>% summarize(neutralA_winprob = mean(winner == "A")) %>% pull()
+  #   neutralA_logodds <- log(neutralA_winprob / (1 - neutralA_winprob))
+  #   value <- neutralA_logodds - home_adv
+  #   teamA_winprob <- exp(value) / (1 + exp(value))
+  #   
+  # } else {
+  #   stop("Entry for location must be one of: ('A', 'B', 'neutral')")
+  # }
+  
+  # Compute the neutral win probability first
+  neutralA_winprob <- probability_sim %>% summarize(neutralA_winprob = mean(winner == "A")) %>% pull()
+  neutralA_logodds <- log(neutralA_winprob / (1 - neutralA_winprob))
+  
+  win_probs <- tibble(
+    location = c("neutral", "A", "B"),
+    teamA_winprob = c(
+      neutralA_winprob,
+      exp(neutralA_logodds + home_adv) / (1 + exp(neutralA_logodds + home_adv)),
+      exp(neutralA_logodds - home_adv) / (1 + exp(neutralA_logodds - home_adv))
+    )
+  )
+  
+  
+  list(
+    win_probs = win_probs,
+    probability_sim = probability_sim,
+    set4_percentage = mean(!is.na(probability_sim$winner_set4)),
+    set5_percentage = mean(!is.na(probability_sim$winner_set5))
+  )
+
+}
+```
+
+```{r}
+simulation <- simulate(power, "texas", "nebraska")
+print(simulation$win_probs)
+print(simulation$set4_percentage)
+print(simulation$set5_percentage)
+```
+
+```{r}
+# visualize the distribution of wins across sets
+simulation$probability_sim %>% summarize(mean(winner == "A"))
+  mutate(across(where(is.character), ~replace_na(., "none"))) %>%
+  summarize(across(starts_with("winner_set"), ~sum(. == "A"), .names = "A{.col}"),
+            across(starts_with("winner_set"), ~sum(. == "B"), .names = "B{.col}")) %>%
+  pivot_longer(everything(), names_to = "key", values_to = "count") %>%
+  mutate(
+    team = substr(key, 1, 1),
+    set_num = substr(key, nchar(key), nchar(key)),
+    set = factor(set_num, levels = as.character(1:5), labels = paste("Set", 1:5)),
+    signed_count = ifelse(team == "A", count, -count),
+    abs_signed = abs(signed_count)
+  ) %>%
+  group_by(set_num) %>%
+  mutate(p_win_set = abs_signed / sum(abs_signed)) %>%
+  ungroup() %>%
+  ggplot(aes(x = set, y = signed_count, fill = team)) +
+  geom_col(width = 0.7, position = "identity") +
+  geom_text(aes(y = signed_count / 2, label = scales::percent(p_win_set, accuracy = 1)), color = "white") +
+  scale_fill_manual(values = c("A" = "#CC5500", "B" = "#E41C38")) +
+  geom_hline(yintercept = 0, color = "black") +
+  labs(title = "Set Wins by Team", x = NULL, y = "Number of Set Wins", fill = "Team") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5))
+```
+
+
