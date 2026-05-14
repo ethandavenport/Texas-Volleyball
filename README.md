@@ -1,5 +1,7 @@
 # Texas-Volleyball
 
+This repository highlights a selection of volleyball analytics visualizations developed to support coaching and scouting decisions. Each plot is accompanied by a brief writeup covering what the analysis shows and how to interpret the specific example displayed. The work spans serve strategy, passing efficiency, and setter decision-making, with the goal of translating data-driven insights into language and visuals that are accessible to coaches at any level of analytics experience.
+
 <p align="center">
   <kbd>
   <img width="783" height="447" alt="image" src="https://github.com/user-attachments/assets/67f44aa2-3800-47e7-881f-587c18f7a1a8" />
