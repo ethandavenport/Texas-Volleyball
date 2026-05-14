@@ -8,9 +8,11 @@
 
 **This example's takeaway:** No surprises here. The highest-value zone sits a few feet off the net, slightly right of center, which is the traditional passing target for good reason. Value drops off gradually but consistently as passes drift toward the net, push wide, or fall deep into the court. Based on nearly 100,000 observations, even a modest drift out of the green zone carries a measurable cost to offensive efficiency.
 
-<kbd>
-<img width="933" height="723" alt="image" src="https://github.com/user-attachments/assets/a0f8997a-c83b-4d0e-9591-1d10961c4a84" />
-</kbd>
+<p align="center">
+  <kbd>
+  <img width="933" height="723" alt="image" src="https://github.com/user-attachments/assets/a0f8997a-c83b-4d0e-9591-1d10961c4a84" />
+  </kbd>
+</p>
 
 **Potential applications:** Similar to the passing map, this visualization applies the same expected point value framework but shifts the focus to where attacks are launched from on the court. Coaches can filter by team, individual setter, and specific play type to see which attack locations produce the best results, helping inform how setters distribute the ball and where hitters should be positioned.
 
